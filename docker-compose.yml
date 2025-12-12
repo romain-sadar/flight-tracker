@@ -1,0 +1,10 @@
+services:
+  opensky_ingest:
+    build: .
+    container_name: opensky_ingest
+    env_file:
+      - .env
+    environment:
+      GOOGLE_APPLICATION_CREDENTIALS: /secrets/gcp_creds.json
+    volumes:
+      - ./secrets/gcp_creds.json:/secrets/gcp_creds.json:ro
