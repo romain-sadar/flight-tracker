@@ -4,6 +4,7 @@ from prefect import flow
 from silver_etl import silver_etl_task
 from gold_etl import gold_etl_task
 from ingestion.opensky_ingest_flow import opensky_ingest_flow
+from training.train_model import train_models_flow
 
 @flow(name="flight_pipeline_flow")
 def flight_pipeline():
@@ -17,6 +18,9 @@ def flight_pipeline():
 
     # Step 2: Silver
     silver_etl_task(GCS_BUCKET)
+
+    # Step 3: Train models
+    train_models_flow()
 
     # Step 3: Gold
     gold_etl_task(GCS_BUCKET, GCP_PROJECT, BQ_DATASET, BQ_PRED_TABLE)
