@@ -1,76 +1,127 @@
 import os
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, current_timestamp, expr, to_date
+from pyspark.sql.window import Window
+from pyspark.sql.functions import col, lag, unix_timestamp, when
 from pyspark.ml.feature import VectorAssembler
 from pyspark.ml.regression import RandomForestRegressionModel
+from prefect import flow, task, get_run_logger
 
-# -----------------------------
-# Env vars
-# -----------------------------
-GCS_BUCKET = os.getenv("GCS_BUCKET")
-GCP_PROJECT = os.getenv("GCP_PROJECT_ID")
-BQ_DATASET = os.getenv("BQ_DATASET_ID")
-BQ_PRED_TABLE = os.getenv("BQ_PRED_TABLE", "gold_predictions")
 
-if not all([GCS_BUCKET, GCP_PROJECT, BQ_DATASET]):
-    raise RuntimeError("Missing required env vars")
+@task(retries=3, retry_delay_seconds=10)
+def predict_positions(gcs_bucket: str):
 
-spark = SparkSession.builder \
-    .appName("BatchPredict") \
-    .config("spark.jars.packages", "com.google.cloud.bigdataoss:gcs-connector:hadoop3-2.2.22") \
-    .getOrCreate()
+    logger = get_run_logger()
+    logger.info("Starting trajectory prediction...")
 
-# -----------------------------
-# Read Silver ETL data
-# -----------------------------
-silver_path = f"gs://{GCS_BUCKET}/silver/flight_states/"
-silver_df = spark.read.parquet(silver_path)
+    spark = SparkSession.builder \
+        .appName("PredictAircraftPositions") \
+        .config("spark.jars.packages", "com.google.cloud.bigdataoss:gcs-connector:hadoop3-2.2.22") \
+        .getOrCreate()
 
-# Filter last hour (adjust interval as needed)
-silver_df = silver_df.filter(col("ingest_ts") > current_timestamp() - expr("INTERVAL 1 HOUR"))
+    silver_path = f"gs://{gcs_bucket}/silver/flight_states/"
+    df = spark.read.parquet(silver_path)
 
-# -----------------------------
-# Features
-# -----------------------------
-feature_cols = ["lat", "lon", "baro_altitude", "velocity", "heading",
-                "vertical_rate", "accel", "turn_rate"]
-assembler = VectorAssembler(inputCols=feature_cols, outputCol="features")
-feature_df = assembler.transform(silver_df)
+    logger.info(f"Loaded {df.count()} rows from silver.")
 
-# -----------------------------
-# Load pretrained models
-# -----------------------------
-model_lat = RandomForestRegressionModel.load(f"gs://{GCS_BUCKET}/models/rf_lat_model")
-model_lon = RandomForestRegressionModel.load(f"gs://{GCS_BUCKET}/models/rf_lon_model")
-model_alt = RandomForestRegressionModel.load(f"gs://{GCS_BUCKET}/models/rf_alt_model")
+    # window for aircraft history
+    w = Window.partitionBy("icao24").orderBy("time_position")
 
-# -----------------------------
-# Predict
-# -----------------------------
-pred_lat = model_lat.transform(feature_df).withColumnRenamed("prediction", "pred_lat")
-pred_lon = model_lon.transform(feature_df).withColumnRenamed("prediction", "pred_lon")
-pred_alt = model_alt.transform(feature_df).withColumnRenamed("prediction", "pred_alt")
+    df = df.withColumn("prev_velocity", lag("velocity", 1).over(w)) \
+        .withColumn("prev_heading", lag("heading", 1).over(w)) \
+        .withColumn("prev_time", lag("time_position", 1).over(w)) \
+        .withColumn("time_diff_sec",
+                    unix_timestamp("time_position") - unix_timestamp("prev_time")) \
+        .withColumn(
+            "accel",
+            when(col("time_diff_sec") != 0,
+                 (col("velocity") - col("prev_velocity")) / col("time_diff_sec")
+                 ).otherwise(0.0)
+        ) \
+        .withColumn(
+            "turn_rate",
+            when(col("time_diff_sec") != 0,
+                 (col("heading") - col("prev_heading")) / col("time_diff_sec")
+                 ).otherwise(0.0)
+        )
 
-# Merge predictions
-pred_df = pred_lat.select("icao24", "time_position", "ingest_ts", "pred_lat") \
-    .join(pred_lon.select("icao24", "time_position", "pred_lon"), on=["icao24", "time_position"]) \
-    .join(pred_alt.select("icao24", "time_position", "pred_alt"), on=["icao24", "time_position"])
+    feature_cols = [
+        "lat",
+        "lon",
+        "baro_altitude",
+        "velocity",
+        "heading",
+        "vertical_rate",
+        "accel",
+        "turn_rate"
+    ]
 
-# Partition column
-pred_df = pred_df.withColumn("ingest_date", to_date("ingest_ts"))
+    df = df.dropna(subset=feature_cols)
 
-# -----------------------------
-# Write to GCS
-# -----------------------------
-gcs_pred_path = f"gs://{GCS_BUCKET}/gold/predictions/"
-pred_df.write.mode("append").partitionBy("ingest_date").parquet(gcs_pred_path)
+    assembler = VectorAssembler(
+        inputCols=feature_cols,
+        outputCol="features",
+        handleInvalid="skip"
+    )
 
-# -----------------------------
-# Write to BigQuery
-# -----------------------------
-pred_df.write.mode("append").format("bigquery") \
-    .option("table", f"{GCP_PROJECT}.{BQ_DATASET}.{BQ_PRED_TABLE}") \
-    .save()
+    data = assembler.transform(df)
 
-spark.stop()
-print("Predictions completed successfully.")
+    # Load trained models
+    lat_model = RandomForestRegressionModel.load(
+        f"gs://{gcs_bucket}/models/rf_lat_model"
+    )
+
+    lon_model = RandomForestRegressionModel.load(
+        f"gs://{gcs_bucket}/models/rf_lon_model"
+    )
+
+    alt_model = RandomForestRegressionModel.load(
+        f"gs://{gcs_bucket}/models/rf_alt_model"
+    )
+
+    logger.info("Models loaded.")
+
+    # predictions
+    pred_lat = lat_model.transform(data).withColumnRenamed(
+        "prediction", "predicted_lat")
+
+    pred_lon = lon_model.transform(pred_lat).withColumnRenamed(
+        "prediction", "predicted_lon")
+
+    pred_alt = alt_model.transform(pred_lon).withColumnRenamed(
+        "prediction", "predicted_alt")
+
+    result = pred_alt.select(
+        "icao24",
+        "time_position",
+        "lat",
+        "lon",
+        "baro_altitude",
+        "predicted_lat",
+        "predicted_lon",
+        "predicted_alt"
+    )
+
+    output_path = f"gs://{gcs_bucket}/gold/trajectory_predictions/"
+
+    result.write.mode("overwrite").parquet(output_path)
+
+    logger.info(f"Predictions saved to {output_path}")
+
+    spark.stop()
+
+    return output_path
+
+
+@flow(name="predict_positions_flow")
+def predict_positions_flow():
+
+    gcs_bucket = os.getenv("GCS_BUCKET")
+
+    if not gcs_bucket:
+        raise RuntimeError("Missing GCS_BUCKET environment variable")
+
+    predict_positions(gcs_bucket)
+
+
+if __name__ == "__main__":
+    predict_positions_flow()

@@ -49,11 +49,17 @@ def silver_etl_task(gcs_bucket: str):
     raw_df = raw_df.withColumn("source_file", input_file_name())
 
     silver_df = raw_df \
-        .withColumn("time_position", to_timestamp("time_position")) \
-        .withColumn("last_contact", to_timestamp("last_contact")) \
-        .filter(col("icao24").isNotNull()) \
-        .filter(col("lat").between(-90, 90) & col("lon").between(-180, 180)) \
-        .dropDuplicates(["icao24", "time_position"])
+    .withColumn("time_position", to_timestamp("time_position")) \
+    .withColumn("last_contact", to_timestamp("last_contact")) \
+    .filter(col("icao24").isNotNull()) \
+    .filter(col("lat").between(-90, 90) & col("lon").between(-180, 180)) \
+    .filter(
+        col("velocity").isNotNull() &
+        col("heading").isNotNull() &
+        col("vertical_rate").isNotNull() &
+        col("baro_altitude").isNotNull()
+    ) \
+    .dropDuplicates(["icao24", "time_position"])
 
     silver_df = silver_df \
         .withColumn("year", year("ingest_ts")) \

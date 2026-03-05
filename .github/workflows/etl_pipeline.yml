@@ -14,11 +14,20 @@ jobs:
       BQ_DATASET_ID: flight_data
       BQ_TABLE_NAME: gold_flight_states
       GCS_BUCKET: flight-tracking-big-data
+      BQ_PRED_TABLE: "predict_flight_states"
       GOOGLE_APPLICATION_CREDENTIALS: /tmp/gcp_creds.json
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v3
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -38,12 +47,22 @@ jobs:
           EOF
           export GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp_creds.json
 
+
+      - name: Cache GCS connector jar
+        uses: actions/cache@v4
+        with:
+          path: jars
+          key: gcs-connector-jar-v1
       - name: Download GCS connector
+        if: steps.cache.outputs.cache-hit != 'true'
         run: |
           mkdir -p jars
           wget -O jars/gcs-connector-hadoop3-2.2.11-shaded.jar \
             https://storage.googleapis.com/hadoop-lib/gcs/gcs-connector-latest-hadoop3.jar
 
+
       - name: Run Prefect Orchestrator Flow
         run: |
+          export SILVER_FULL_LOAD=false
+          export GOLD_FULL_LOAD=false
           python etl/flow.py

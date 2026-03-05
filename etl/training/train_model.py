@@ -7,6 +7,9 @@ from pyspark.ml.regression import RandomForestRegressor
 from pyspark.ml.evaluation import RegressionEvaluator
 from prefect import flow, task, get_run_logger
 
+PREDICTION_HORIZON_ROWS = 5
+
+
 @task(retries=3, retry_delay_seconds=10)
 def train_rf_models(gcs_bucket: str):
     logger = get_run_logger()
@@ -23,27 +26,37 @@ def train_rf_models(gcs_bucket: str):
 
     # Compute lag features for accel and turn_rate
     w = Window.partitionBy("icao24").orderBy("time_position")
-    df = df.withColumn("prev_velocity", lag("velocity", 1).over(w)) \
-           .withColumn("prev_heading", lag("heading", 1).over(w)) \
-           .withColumn("prev_time", lag("time_position", 1).over(w)) \
-           .withColumn("time_diff_sec", unix_timestamp("time_position") - unix_timestamp("prev_time")) \
-           .withColumn(
-               "accel",
-               when(col("time_diff_sec") != 0,
-                    (col("velocity") - col("prev_velocity")) / col("time_diff_sec")
-                   ).otherwise(0.0)
-           ) \
-           .withColumn(
-               "turn_rate",
-               when(col("time_diff_sec") != 0,
-                    (col("heading") - col("prev_heading")) / col("time_diff_sec")
-                   ).otherwise(0.0)
-           )
+
+    df = df \
+        .withColumn("prev_lat", lag("lat", 1).over(w)) \
+        .withColumn("prev_lon", lag("lon", 1).over(w)) \
+        .withColumn("prev_alt", lag("baro_altitude", 1).over(w)) \
+        .withColumn("prev_velocity", lag("velocity", 1).over(w)) \
+        .withColumn("prev_heading", lag("heading", 1).over(w)) \
+        .withColumn("prev_time", lag("time_position", 1).over(w)) \
+        .withColumn("time_diff_sec", unix_timestamp("time_position") - unix_timestamp("prev_time")) \
+        .withColumn(
+            "accel",
+            when(col("time_diff_sec") != 0,
+                (col("velocity") - col("prev_velocity")) / col("time_diff_sec")
+            ).otherwise(0.0)
+        ) \
+        .withColumn(
+            "turn_rate",
+            when(col("time_diff_sec") != 0,
+                (col("heading") - col("prev_heading")) / col("time_diff_sec")
+            ).otherwise(0.0)
+        ) \
+        .withColumn(
+            "altitude_change",
+            col("baro_altitude") - col("prev_alt")
+        )
 
     # Compute target columns: next lat/lon/alt
-    df = df.withColumn("future_lat", lead("lat", 1).over(w)) \
-           .withColumn("future_lon", lead("lon", 1).over(w)) \
-           .withColumn("future_alt", lead("baro_altitude", 1).over(w))
+    logger.info(f"Predicting aircraft position {PREDICTION_HORIZON_ROWS} observations ahead (~30 seconds).")
+    df = df.withColumn("future_lat", lead("lat", PREDICTION_HORIZON_ROWS).over(w)) \
+        .withColumn("future_lon", lead("lon", PREDICTION_HORIZON_ROWS).over(w)) \
+        .withColumn("future_alt", lead("baro_altitude", PREDICTION_HORIZON_ROWS).over(w))
 
     # Keep only rows where features and targets exist
     df = df.filter(
@@ -53,11 +66,42 @@ def train_rf_models(gcs_bucket: str):
         col("future_lon").isNotNull() &
         col("future_alt").isNotNull()
     )
+    df = df.cache()
     logger.info(f"{df.count()} rows available for training after filtering.")
 
-    feature_cols = ["lat", "lon", "baro_altitude", "velocity", "heading",
-                    "vertical_rate", "accel", "turn_rate"]
-    assembler = VectorAssembler(inputCols=feature_cols, outputCol="features")
+    feature_cols = [
+        "lat",
+        "lon",
+        "baro_altitude",
+
+        "prev_lat",
+        "prev_lon",
+        "prev_alt",
+
+        "velocity",
+        "prev_velocity",
+
+        "heading",
+        "prev_heading",
+
+        "vertical_rate",
+
+        "accel",
+        "turn_rate",
+        "altitude_change",
+    ]
+    
+    df = df.dropna(subset=feature_cols + [
+        "future_lat",
+        "future_lon",
+        "future_alt"
+    ])
+
+    assembler = VectorAssembler(
+        inputCols=feature_cols,
+        outputCol="features",
+        handleInvalid="skip"
+    )
     data = assembler.transform(df)
 
     train, test = data.randomSplit([0.8, 0.2], seed=42)
