@@ -14,4 +14,4 @@ COPY flows/ ./flows/
 RUN mkdir -p /secrets
 ENV PYTHONUNBUFFERED=1
 
-CMD ["python", "-m", "flows.opensky_ingest_flow"]
+CMD ["python", "-m", "ingestion.opensky_ingest_flow"]
