@@ -48,18 +48,21 @@ jobs:
           export GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp_creds.json
 
 
-      - name: Cache GCS connector jar
+      - name: Cache jars
         uses: actions/cache@v4
         with:
           path: jars
-          key: gcs-connector-jar-v1
+          key: jars-cache-v1
+
       - name: Download GCS connector
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
           mkdir -p jars
           wget -O jars/gcs-connector-hadoop3-2.2.11-shaded.jar \
             https://storage.googleapis.com/hadoop-lib/gcs/gcs-connector-latest-hadoop3.jar
-
+          wget -O jars/spark-bigquery-with-dependencies_2.12-0.30.0.jar \
+            https://repo1.maven.org/maven2/com/google/cloud/spark/spark-bigquery-with-dependencies_2.12/0.30.0/spark-bigquery-with-dependencies_2.12-0.30.0.jar
+          ls -l jars
 
       - name: Run Prefect Orchestrator Flow
         run: |

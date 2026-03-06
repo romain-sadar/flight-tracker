@@ -11,13 +11,18 @@ def gold_etl_task(gcs_bucket: str, gcp_project: str, bq_dataset: str, bq_table: 
     full_load = os.getenv("SILVER_FULL_LOAD", "false").lower() == "true"
     logger.info("Running GOLD full load." if full_load else "Running GOLD incremental load (last 1 hour).")
 
+    bq_jar_path = os.path.abspath("jars/spark-bigquery-with-dependencies_2.12-0.30.0.jar")
+    if not os.path.exists(bq_jar_path):
+        raise FileNotFoundError(f"BigQuery jar not found at {bq_jar_path}")
+    gcs_jar_path = os.path.abspath("jars/gcs-connector-hadoop3-2.2.11-shaded.jar")
+
     spark = SparkSession.builder \
         .appName("GoldETL_CI_Safe") \
-        .config("spark.jars", "jars/gcs-connector-hadoop3-2.2.11-shaded.jar") \
+        .config("spark.jars", f"{gcs_jar_path},{bq_jar_path}") \
+        .config("spark.jars.packages", "com.google.cloud.spark:spark-bigquery-with-dependencies_2.12:0.30.0") \
         .config("spark.hadoop.fs.gs.impl", "com.google.cloud.hadoop.fs.gcs.GoogleHadoopFileSystem") \
         .config("spark.hadoop.fs.AbstractFileSystem.gs.impl", "com.google.cloud.hadoop.fs.gcs.GoogleHadoopFS") \
         .getOrCreate()
-
     silver_path = f"gs://{gcs_bucket}/silver/flight_states/"
     try:
         silver_df = spark.read.option("basePath", silver_path) \
@@ -54,7 +59,7 @@ def gold_etl_task(gcs_bucket: str, gcp_project: str, bq_dataset: str, bq_table: 
 
     try:
         silver_df.write \
-            .format("bigquery") \
+            .format("com.google.cloud.spark.bigquery") \
             .option("table", f"{gcp_project}.{bq_dataset}.{bq_table}") \
             .option("temporaryGcsBucket", gcs_bucket) \
             .mode(write_mode) \
